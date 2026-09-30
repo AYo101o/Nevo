@@ -867,6 +867,12 @@ impl Contract {
     }
 
     /// Set application milestones and enforce sum(amounts) == pool goal.
+    ///
+    /// # Panics
+    /// - `ContractError::PoolNotFound` if pool_id is invalid
+    /// - `ContractError::StudentHasNotApplied` if the student never applied
+    /// - `"Application is not approved"` if the application has not been
+    ///   approved via `approve_application` (Issue #1345)
     pub fn setup_application_milestones(
         env: Env,
         pool_id: u32,
@@ -888,6 +894,13 @@ impl Contract {
         );
         if !env.storage().persistent().has(&applicant_key) {
             env.panic_with_error(ContractError::StudentHasNotApplied);
+        }
+
+        // Issue #1345: milestones may only be configured for an approved
+        // application. Mirrors the same check already enforced by claim_funds.
+        let status = Self::get_application_status(env.clone(), pool_id, student.clone());
+        if status != String::from_str(&env, APPLICATION_STATUS_APPROVED) {
+            panic!("Application is not approved");
         }
 
         if milestones.is_empty() {
