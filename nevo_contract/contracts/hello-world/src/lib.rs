@@ -134,7 +134,7 @@ pub enum ContractError {
     InvalidPoolName = 16,
     /// Pool funding goal is zero.
     InvalidPoolTarget = 17,
-    /// Pool application deadline is already in the past.
+    /// Pool application deadline is zero or already in the past.
     InvalidPoolDeadline = 18,
 }
 
@@ -189,6 +189,10 @@ pub fn set_deadline(deadline: u64) -> Result<(), &'static str> {
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Application {
+    pub pool_id: u32,
+    pub student: Address,
+    pub application_data: String,
+    pub status: String,
     /// The total amount the student is approved to receive from this pool.
     pub approved_amount: i128,
     /// Running total of funds already disbursed to the student.
@@ -307,7 +311,7 @@ impl Contract {
             .storage()
             .persistent()
             .get::<_, Address>(&admin_key)
-            .expect("Admin not set");
+            .unwrap_or_else(|| env.panic_with_error(ContractError::AdminNotSet));
 
         // Enforce root protocol admin authorization.
         admin.require_auth();
@@ -331,7 +335,7 @@ impl Contract {
         env.storage()
             .persistent()
             .get::<_, BytesN<32>>(&school_key)
-            .expect("School not registered")
+            .unwrap_or_else(|| env.panic_with_error(ContractError::SchoolNotRegistered))
     }
 
     // ─── Pool Management ─────────────────────────────────────────────────────
@@ -352,7 +356,7 @@ impl Contract {
         application_deadline: u64,
     ) -> u32 {
         if title.len() == 0 {
-            panic!("Title cannot be empty");
+            env.panic_with_error(ContractError::InvalidPoolName);
         }
         if description.len() == 0 {
             panic!("Description cannot be empty");
@@ -360,8 +364,11 @@ impl Contract {
         if description.len() as u32 > MAX_DESCRIPTION_LENGTH as u32 {
             panic!("Description exceeds maximum length");
         }
+        if goal == 0 {
+            env.panic_with_error(ContractError::InvalidPoolTarget);
+        }
         if application_deadline == 0 {
-            panic!("Duration must be greater than zero");
+            env.panic_with_error(ContractError::InvalidPoolDeadline);
         }
 
         let pool_count_key = Symbol::new(&env, POOL_COUNT);
@@ -788,9 +795,27 @@ impl Contract {
         app_count += 1;
 
         let app_key = (Symbol::new(&env, APPLICATION_PREFIX), pool_id, app_count);
-        env.storage()
-            .persistent()
-            .set(&app_key, &(app_count, student.clone(), application_data));
+        env.storage().persistent().set(
+            &app_key,
+            &(app_count, student.clone(), application_data.clone()),
+        );
+
+        let application_key = (
+            Symbol::new(&env, CLAIMED_AMOUNT_PREFIX),
+            pool_id,
+            student.clone(),
+        );
+        env.storage().persistent().set(
+            &application_key,
+            &Application {
+                pool_id,
+                student: student.clone(),
+                application_data,
+                status: String::from_str(&env, "Pending"),
+                approved_amount: 0,
+                amount_claimed: 0,
+            },
+        );
 
         env.storage().persistent().set(&applicant_key, &true);
         env.storage().persistent().set(&count_key, &app_count);
@@ -905,6 +930,22 @@ impl Contract {
             student.clone(),
         );
         env.storage().persistent().set(&status_key, &status);
+
+        let application_key = (
+            Symbol::new(&env, CLAIMED_AMOUNT_PREFIX),
+            pool_id,
+            student,
+        );
+        if let Some(mut application) = env
+            .storage()
+            .persistent()
+            .get::<_, Application>(&application_key)
+        {
+            application.status = status;
+            env.storage()
+                .persistent()
+                .set(&application_key, &application);
+        }
     }
 
     /// Get application status for a student in a pool.
@@ -942,7 +983,7 @@ impl Contract {
     }
 
     /// Get the full Application record for a student in a pool.
-    /// Returns `None` if the student has not yet made any claim.
+    /// Returns `None` if the student has not applied to the pool.
     pub fn get_application(env: Env, pool_id: u32, student: Address) -> Option<Application> {
         let app_key = (
             Symbol::new(&env, CLAIMED_AMOUNT_PREFIX),
@@ -1021,6 +1062,10 @@ impl Contract {
                         .persistent()
                         .get::<_, Application>(&claim_key)
                         .unwrap_or(Application {
+                            pool_id,
+                            student: student.clone(),
+                            application_data: String::from_str(&env, ""),
+                            status: status.clone(),
                             approved_amount: 0,
                             amount_claimed: 0,
                         });
@@ -1125,9 +1170,17 @@ impl Contract {
             .persistent()
             .get::<_, Application>(&app_key)
             .unwrap_or(Application {
+                pool_id,
+                student: student.clone(),
+                application_data: String::from_str(&env, ""),
+                status: Self::get_application_status(env.clone(), pool_id, student.clone()),
                 approved_amount: collected,
                 amount_claimed: 0,
             });
+
+        if application.approved_amount == 0 {
+            application.approved_amount = collected;
+        }
 
         // Enforce the partial-payment invariant
         if application.amount_claimed + claim_amount > collected {
@@ -1286,7 +1339,6 @@ impl Contract {
     /// The deadline must be in the future (greater than the current ledger).
     ///
     /// # Panics
-    /// - `"Pool not found"` if pool_id is invalid
     /// - `ContractError::PoolNotFound` if pool_id is invalid
     /// - `"Error(Auth, InvalidAction)"` if caller is not the pool sponsor
     /// - `"Deadline must be in the future"` if deadline <= current ledger
@@ -1295,7 +1347,7 @@ impl Contract {
             .storage()
             .persistent()
             .get::<_, Pool>(&pool_id)
-            .expect("Pool not found");
+            .unwrap_or_else(|| env.panic_with_error(ContractError::PoolNotFound));
 
         pool.sponsor.require_auth();
 
@@ -1492,7 +1544,7 @@ impl Contract {
     ///
     /// # Panics
     /// - `ContractError::AdminNotSet` if no admin has been configured
-    /// - `"Error(Auth, InvalidAction)"` if the caller is not the stored admin
+    /// - `ContractError::UnauthorizedAdmin` if the caller is not the stored admin
     /// - `ContractError::PoolNotFound` if the pool does not exist
     /// - `ContractError::PoolIsClosed` if the pool is closed
     /// - `ContractError::InvalidPoolState` if the pool is not `Active`
@@ -1513,7 +1565,7 @@ impl Contract {
             .get::<_, Address>(&admin_key)
             .unwrap_or_else(|| env.panic_with_error(ContractError::AdminNotSet));
         if stored_admin != admin {
-            panic!("Error(Auth, InvalidAction)");
+            env.panic_with_error(ContractError::UnauthorizedAdmin);
         }
 
         let pool: Pool = env
@@ -1727,16 +1779,43 @@ impl Contract {
             .get::<_, Address>(&token_key)
             .expect("Crowdfunding token not set")
     }
+
+    /// Return the number of ledgers a donor must wait after a pool's deadline
+    /// before `refund_donation()` will succeed.
+    ///
+    /// This corresponds to the compile-time constant `REFUND_GRACE_PERIOD_LEDGERS`
+    /// (currently 17 280 ledgers, ≈ 24 hours at a 5-second ledger cadence).
+    /// Off-chain integrators should call this getter rather than hard-coding the
+    /// value so they remain correct if the constant is ever updated.
+    pub fn get_refund_grace_period_ledgers(_env: Env) -> u32 {
+        REFUND_GRACE_PERIOD_LEDGERS
+    }
+
+    /// Return the number of seconds an admin must wait after
+    /// `request_emergency_withdraw()` before `execute_emergency_withdraw()`
+    /// will succeed.
+    ///
+    /// This corresponds to the compile-time constant `GRACE_PERIOD_SECS`
+    /// (currently 86 400 seconds, i.e. 24 hours). Off-chain integrators
+    /// should call this getter rather than hard-coding the value so they
+    /// remain correct if the constant is ever updated.
+    pub fn get_emergency_grace_period_secs(_env: Env) -> u64 {
+        GRACE_PERIOD_SECS
+    }
 }
 
 mod test;
+mod test_auth_bypass;
 mod test_issues;
+mod test_numeric_overflow;
 mod test_register_school;
 mod test_contract_initialization;
 mod test_pool_creation;
 mod test_pool_retrieval;
 mod test_campaign_lifecycle;
 mod test_withdraw;
+mod test_issue_1108_refund_grace_period;
+mod test_issue_1109_emergency_grace_period;
 mod test_issue_1287_pool_multisig;
 mod test_concurrent_pools;
 mod test_concurrent_campaigns;
